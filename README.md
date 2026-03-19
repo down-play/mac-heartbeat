@@ -94,6 +94,58 @@ If you prefer 1 MB, set:
 maxLogBytes: 1 * 1024 * 1024
 ```
 
+## What The Score Means
+
+The `Score` is a simple 0-100 stress score that estimates how "slow" or overloaded the machine looks.
+
+Lower is better. Higher means the machine looks more stressed.
+
+It is based on a weighted mix of:
+
+- CPU load
+- Memory pressure
+- Swap usage
+- Disk usage
+- Event-loop lag (responsiveness)
+
+The current weighting is:
+
+- CPU: 30%
+- Memory pressure: 28%
+- Swap: 22%
+- Disk: 10%
+- Lag: 10%
+
+Each metric is compared against a threshold in `heartbeat.js`, then combined into one score.
+
+Current thresholds:
+
+- Pressure: `60%`
+- Swap: `5 GB`
+- CPU: `85%`
+- Disk: `90%`
+- Lag: `120 ms`
+
+Levels are:
+
+- `OK` under `60`
+- `WARN` from `60` to `79`
+- `CRITICAL` at `80+`
+
+To adjust thresholds, edit the `config` object near the top of [heartbeat.js](/Users/nickmaione/Code/mac-heartbeat/heartbeat.js).
+
+Most useful settings:
+
+- `thresholds.pressurePercent`
+- `thresholds.swapGb`
+- `thresholds.cpuPercent`
+- `thresholds.diskPercent`
+- `thresholds.lagMs`
+- `slowScore.warn`
+- `slowScore.critical`
+
+If you want to change how much each metric affects the score, edit the weights inside `computeSlowScore()`.
+
 ## Alerts
 
 On sustained WARN/CRITICAL conditions, the script triggers a macOS dialog via `osascript`.

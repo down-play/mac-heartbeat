@@ -135,6 +135,12 @@ function compactReasonTag(reasons) {
     return tags.join('+');
 }
 
+function formatBatteryStatus(snapshot) {
+    if (typeof snapshot.batteryPercent !== 'number') return 'BAT -';
+    const charging = snapshot.batteryCharging ? ' ϟ' : '';
+    return `BAT ${snapshot.batteryPercent.toFixed(0)}%${charging}`;
+}
+
 function formatConsoleHeartbeat(snapshot, previousSnapshot) {
     const pulse = getPulse(snapshot.level);
     const cpuTrend = trendArrow(snapshot.cpuPercent, previousSnapshot?.cpuPercent, 0.5);
@@ -144,7 +150,8 @@ function formatConsoleHeartbeat(snapshot, previousSnapshot) {
     const reasonTag = snapshot.level === 'ok' ? '' : compactReasonTag(snapshot.reasons);
     const reasonPart = reasonTag ? ` | Reason ${reasonTag}` : '';
     const causePart = snapshot.level === 'ok' ? '' : ` | Cause ${snapshot.interpretation.cause}`;
-    return `[${new Date(snapshot.timestamp).toLocaleString()}] ${pulse} | Level ${snapshot.level.toUpperCase()} | Score ${snapshot.slowScore} | CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend} | Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend} | Disk ${snapshot.diskPercent.toFixed(0)}% | Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend} | Swap ${snapshot.swapGb.toFixed(2)}GB | Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend} | Hogs ${snapshot.topApps}${reasonPart}${causePart}`;
+    const batteryPart = ` | ${formatBatteryStatus(snapshot)}`;
+    return `[${new Date(snapshot.timestamp).toLocaleString()}] ${pulse} | Level ${snapshot.level.toUpperCase()} | Score ${snapshot.slowScore} | CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend} | Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend} | Disk ${snapshot.diskPercent.toFixed(0)}% | Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend} | Swap ${snapshot.swapGb.toFixed(2)}GB | Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend}${batteryPart} | Hogs ${snapshot.topApps}${reasonPart}${causePart}`;
 }
 
 function buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
@@ -235,11 +242,12 @@ async function logSystemHealth() {
     if (isRunning) return;
     isRunning = true;
     try {
-        const [mem, procs, load, disks] = await Promise.all([
+        const [mem, procs, load, disks, battery] = await Promise.all([
             safeGet('mem', () => si.mem(), { available: 0, swapused: 0, active: 0, total: 1 }),
             safeGet('processes', () => si.processes(), { list: [] }),
             safeGet('cpu', () => si.currentLoad(), { currentLoad: 0 }),
-            safeGet('disk', () => si.fsSize(), [])
+            safeGet('disk', () => si.fsSize(), []),
+            safeGet('battery', () => si.battery(), { hasbattery: false, percent: null, ischarging: false, acconnected: false })
         ]);
         const timestamp = new Date().toLocaleString();
 
@@ -266,6 +274,8 @@ async function logSystemHealth() {
             freeGb: Number(freeGb.toFixed(2)),
             swapGb: Number(swapGb.toFixed(2)),
             lagMs: Number(lagMs.toFixed(1)),
+            batteryPercent: typeof battery.percent === 'number' ? Number(battery.percent.toFixed(0)) : null,
+            batteryCharging: Boolean(battery.ischarging || battery.acconnected),
             slowScore,
             level,
             topApps,
@@ -275,7 +285,11 @@ async function logSystemHealth() {
         latestSnapshot = snapshot;
         pushBounded(metricHistory, snapshot, config.historyLimit);
 
-        const logMessage = `[${timestamp}] Level: ${level.toUpperCase()} | Score: ${slowScore} | Pressure: ${pressurePercent.toFixed(0)}% | CPU: ${cpuPercent.toFixed(0)}% | Disk: ${diskPercent.toFixed(0)}% | Lag: ${lagMs.toFixed(0)}ms | Free: ${freeGb.toFixed(2)}GB | Swap: ${swapGb.toFixed(2)}GB | Hogs: ${topApps} | Cause: ${interpretation.cause}\n`;
+        const batteryLogPart =
+            typeof snapshot.batteryPercent === 'number'
+                ? ` | Battery: ${snapshot.batteryPercent.toFixed(0)}%${snapshot.batteryCharging ? '⚡' : ''}`
+                : '';
+        const logMessage = `[${timestamp}] Level: ${level.toUpperCase()} | Score: ${slowScore} | Pressure: ${pressurePercent.toFixed(0)}% | CPU: ${cpuPercent.toFixed(0)}% | Disk: ${diskPercent.toFixed(0)}% | Lag: ${lagMs.toFixed(0)}ms | Free: ${freeGb.toFixed(2)}GB | Swap: ${snapshot.swapGb.toFixed(2)}GB${batteryLogPart} | Hogs: ${topApps} | Cause: ${interpretation.cause}\n`;
         const consoleMessage = formatConsoleHeartbeat(snapshot, previousSnapshot);
 
         await rotateLogIfNeeded(timestamp);
