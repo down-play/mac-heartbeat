@@ -141,17 +141,25 @@ function formatBatteryStatus(snapshot) {
     return `BAT ${snapshot.batteryPercent.toFixed(0)}%${charging}`;
 }
 
+function formatTemperatureStatus(snapshot) {
+    if (typeof snapshot.cpuTempC !== 'number') return '';
+    const tempF = (snapshot.cpuTempC * 9) / 5 + 32;
+    return ` | Temp ${tempF.toFixed(0)}F`;
+}
+
 function formatConsoleHeartbeat(snapshot, previousSnapshot) {
     const pulse = getPulse(snapshot.level);
     const cpuTrend = trendArrow(snapshot.cpuPercent, previousSnapshot?.cpuPercent, 0.5);
     const pressureTrend = trendArrow(snapshot.pressurePercent, previousSnapshot?.pressurePercent, 0.5);
     const lagTrend = trendArrow(snapshot.lagMs, previousSnapshot?.lagMs, 1);
     const freeTrend = trendArrow(snapshot.freeGb, previousSnapshot?.freeGb, 0.03);
+    const swapTrend = trendArrow(snapshot.swapGb, previousSnapshot?.swapGb, 0.03);
     const reasonTag = snapshot.level === 'ok' ? '' : compactReasonTag(snapshot.reasons);
     const reasonPart = reasonTag ? ` | Reason ${reasonTag}` : '';
     const causePart = snapshot.level === 'ok' ? '' : ` | Cause ${snapshot.interpretation.cause}`;
     const batteryPart = ` | ${formatBatteryStatus(snapshot)}`;
-    return `[${new Date(snapshot.timestamp).toLocaleString()}] ${pulse} | Level ${snapshot.level.toUpperCase()} | Score ${snapshot.slowScore} | CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend} | Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend} | Disk ${snapshot.diskPercent.toFixed(0)}% | Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend} | Swap ${snapshot.swapGb.toFixed(2)}GB | Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend}${batteryPart} | Hogs ${snapshot.topApps}${reasonPart}${causePart}`;
+    const tempPart = formatTemperatureStatus(snapshot);
+    return `[${new Date(snapshot.timestamp).toLocaleString()}] ${pulse} | Level ${snapshot.level.toUpperCase()} | Score ${snapshot.slowScore} | CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend} | Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend} | Disk ${snapshot.diskPercent.toFixed(0)}% | Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend} | Swap ${snapshot.swapGb.toFixed(2)}GB ${swapTrend} | Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend}${batteryPart}${tempPart} | Hogs ${snapshot.topApps}${reasonPart}${causePart}`;
 }
 
 function buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
@@ -242,18 +250,19 @@ async function logSystemHealth() {
     if (isRunning) return;
     isRunning = true;
     try {
-        const [mem, procs, load, disks, battery] = await Promise.all([
+        const [mem, procs, load, disks, battery, cpuTemp] = await Promise.all([
             safeGet('mem', () => si.mem(), { available: 0, swapused: 0, active: 0, total: 1 }),
             safeGet('processes', () => si.processes(), { list: [] }),
             safeGet('cpu', () => si.currentLoad(), { currentLoad: 0 }),
             safeGet('disk', () => si.fsSize(), []),
-            safeGet('battery', () => si.battery(), { hasbattery: false, percent: null, ischarging: false, acconnected: false })
+            safeGet('battery', () => si.battery(), { hasbattery: false, percent: null, ischarging: false, acconnected: false }),
+            safeGet('cpuTemperature', () => si.cpuTemperature(), { main: null, max: null })
         ]);
         const timestamp = new Date().toLocaleString();
 
         const freeGb = toGB(mem.available);
         const swapGb = toGB(mem.swapused);
-        const pressurePercent = (mem.active / Math.max(mem.total, 1)) * 100;
+        const pressurePercent = ((mem.total - mem.available) / Math.max(mem.total, 1)) * 100;
         const cpuPercent = load.currentLoad;
         const rootDisk = disks.find((d) => d.mount === '/') || disks[0];
         const diskPercent = rootDisk ? rootDisk.use : 0;
@@ -276,6 +285,7 @@ async function logSystemHealth() {
             lagMs: Number(lagMs.toFixed(1)),
             batteryPercent: typeof battery.percent === 'number' ? Number(battery.percent.toFixed(0)) : null,
             batteryCharging: Boolean(battery.ischarging || battery.acconnected),
+            cpuTempC: typeof cpuTemp.main === 'number' ? Number(cpuTemp.main.toFixed(1)) : null,
             slowScore,
             level,
             topApps,
@@ -289,7 +299,11 @@ async function logSystemHealth() {
             typeof snapshot.batteryPercent === 'number'
                 ? ` | Battery: ${snapshot.batteryPercent.toFixed(0)}%${snapshot.batteryCharging ? '⚡' : ''}`
                 : '';
-        const logMessage = `[${timestamp}] Level: ${level.toUpperCase()} | Score: ${slowScore} | Pressure: ${pressurePercent.toFixed(0)}% | CPU: ${cpuPercent.toFixed(0)}% | Disk: ${diskPercent.toFixed(0)}% | Lag: ${lagMs.toFixed(0)}ms | Free: ${freeGb.toFixed(2)}GB | Swap: ${snapshot.swapGb.toFixed(2)}GB${batteryLogPart} | Hogs: ${topApps} | Cause: ${interpretation.cause}\n`;
+        const tempLogPart =
+            typeof snapshot.cpuTempC === 'number'
+                ? ` | Temp: ${(((snapshot.cpuTempC * 9) / 5) + 32).toFixed(0)}F`
+                : '';
+        const logMessage = `[${timestamp}] Level: ${level.toUpperCase()} | Score: ${slowScore} | Pressure: ${pressurePercent.toFixed(0)}% | CPU: ${cpuPercent.toFixed(0)}% | Disk: ${diskPercent.toFixed(0)}% | Lag: ${lagMs.toFixed(0)}ms | Free: ${freeGb.toFixed(2)}GB | Swap: ${snapshot.swapGb.toFixed(2)}GB${batteryLogPart}${tempLogPart} | Hogs: ${topApps} | Cause: ${interpretation.cause}\n`;
         const consoleMessage = formatConsoleHeartbeat(snapshot, previousSnapshot);
 
         await rotateLogIfNeeded(timestamp);
