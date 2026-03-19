@@ -98,10 +98,10 @@ function computeSlowScore({ pressurePercent, swapGb, cpuPercent, diskPercent, la
 
     const weighted =
         pressureScore * 0.28 +
-        swapScore * 0.22 +
+        swapScore * 0.17 +
         cpuScore * 0.30 +
         diskScore * 0.10 +
-        lagScore * 0.10;
+        lagScore * 0.15;
     return Math.round(weighted);
 }
 
