@@ -3,8 +3,19 @@ const fsp = require('fs/promises');
 const { execFile } = require('child_process');
 const http = require('http');
 const { monitorEventLoopDelay } = require('perf_hooks');
+const dotenv = require('dotenv');
 
-const config = {
+dotenv.config();
+dotenv.config({ path: '.env.local', override: true });
+
+function getEnvNumber(name, fallback) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+}
+
+const baseConfig = {
     intervalMs: 30_000,
     logPath: 'log.txt',
     incidentLogPath: 'incidents.jsonl',
@@ -30,6 +41,33 @@ const config = {
         cpuPercent: 85,
         diskPercent: 90,
         lagMs: 120
+    }
+};
+
+const config = {
+    ...baseConfig,
+    intervalMs: getEnvNumber('HEARTBEAT_INTERVAL_MS', baseConfig.intervalMs),
+    maxLogBytes: getEnvNumber('HEARTBEAT_MAX_LOG_BYTES', baseConfig.maxLogBytes),
+    topAppsCount: getEnvNumber('HEARTBEAT_TOP_APPS_COUNT', baseConfig.topAppsCount),
+    alertCooldownMs: getEnvNumber('HEARTBEAT_ALERT_COOLDOWN_MS', baseConfig.alertCooldownMs),
+    dashboardPort: getEnvNumber('HEARTBEAT_DASHBOARD_PORT', baseConfig.dashboardPort),
+    historyLimit: getEnvNumber('HEARTBEAT_HISTORY_LIMIT', baseConfig.historyLimit),
+    incidentLimit: getEnvNumber('HEARTBEAT_INCIDENT_LIMIT', baseConfig.incidentLimit),
+    lagThresholdMs: getEnvNumber('HEARTBEAT_LAG_THRESHOLD_MS', baseConfig.lagThresholdMs),
+    slowScore: {
+        warn: getEnvNumber('HEARTBEAT_SLOW_SCORE_WARN', baseConfig.slowScore.warn),
+        critical: getEnvNumber('HEARTBEAT_SLOW_SCORE_CRITICAL', baseConfig.slowScore.critical)
+    },
+    sustainCycles: {
+        warn: getEnvNumber('HEARTBEAT_SUSTAIN_CYCLES_WARN', baseConfig.sustainCycles.warn),
+        critical: getEnvNumber('HEARTBEAT_SUSTAIN_CYCLES_CRITICAL', baseConfig.sustainCycles.critical)
+    },
+    thresholds: {
+        pressurePercent: getEnvNumber('HEARTBEAT_PRESSURE_PERCENT', baseConfig.thresholds.pressurePercent),
+        swapGb: getEnvNumber('HEARTBEAT_SWAP_GB', baseConfig.thresholds.swapGb),
+        cpuPercent: getEnvNumber('HEARTBEAT_CPU_PERCENT', baseConfig.thresholds.cpuPercent),
+        diskPercent: getEnvNumber('HEARTBEAT_DISK_PERCENT', baseConfig.thresholds.diskPercent),
+        lagMs: getEnvNumber('HEARTBEAT_LAG_MS', baseConfig.thresholds.lagMs)
     }
 };
 

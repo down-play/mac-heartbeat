@@ -37,6 +37,12 @@ npm install
 node heartbeat.js
 ```
 
+To use private local overrides, create a `.env.local` file first:
+
+```bash
+cp .env.example .env.local
+```
+
 ## Run With PM2
 
 Start:
@@ -132,17 +138,31 @@ Levels are:
 - `WARN` from `60` to `79`
 - `CRITICAL` at `80+`
 
-To adjust thresholds, edit the `config` object near the top of [heartbeat.js](/Users/nickmaione/Code/mac-heartbeat/heartbeat.js).
+Shared defaults live near the top of `heartbeat.js`, but you usually should not edit them for personal tuning.
 
-Most useful settings:
+For local-only customization, put overrides in `.env.local` instead. That file is ignored by git, so your personal settings will not affect the repo.
 
-- `thresholds.pressurePercent`
-- `thresholds.swapGb`
-- `thresholds.cpuPercent`
-- `thresholds.diskPercent`
-- `thresholds.lagMs`
-- `slowScore.warn`
-- `slowScore.critical`
+Example:
+
+```env
+HEARTBEAT_PRESSURE_PERCENT=70
+HEARTBEAT_SWAP_GB=8
+HEARTBEAT_CPU_PERCENT=90
+HEARTBEAT_DISK_PERCENT=92
+HEARTBEAT_LAG_MS=150
+```
+
+Most people will only need these local overrides:
+
+- `HEARTBEAT_PRESSURE_PERCENT`
+- `HEARTBEAT_SWAP_GB`
+- `HEARTBEAT_CPU_PERCENT`
+- `HEARTBEAT_DISK_PERCENT`
+- `HEARTBEAT_LAG_MS`
+- `HEARTBEAT_SLOW_SCORE_WARN`
+- `HEARTBEAT_SLOW_SCORE_CRITICAL`
+
+Additional optional overrides are also supported for advanced tuning, including interval, log size, alert cooldown, dashboard port, history limits, and sustain-cycle settings.
 
 If you want to change how much each metric affects the score, edit the weights inside `computeSlowScore()`.
 
