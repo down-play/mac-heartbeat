@@ -2,6 +2,7 @@ const si = require('systeminformation');
 const fsp = require('fs/promises');
 const { execFile } = require('child_process');
 const http = require('http');
+const os = require('os');
 const { monitorEventLoopDelay } = require('perf_hooks');
 const dotenv = require('dotenv');
 
@@ -179,10 +180,94 @@ function formatBatteryStatus(snapshot) {
     return `BAT ${snapshot.batteryPercent.toFixed(0)}%${charging}`;
 }
 
-function formatTemperatureStatus(snapshot) {
-    if (typeof snapshot.cpuTempC !== 'number') return '';
-    const tempF = (snapshot.cpuTempC * 9) / 5 + 32;
-    return ` | Temp ${tempF.toFixed(0)}F`;
+function parseWifiPercent(rssi) {
+    if (typeof rssi !== 'number' || Number.isNaN(rssi)) return null;
+    const clamped = Math.max(-90, Math.min(-30, rssi));
+    return Math.round(((clamped + 90) / 60) * 100);
+}
+
+function getWifiQualityLabel(rssi) {
+    if (typeof rssi !== 'number' || Number.isNaN(rssi)) return null;
+    if (rssi >= -55) return 'Strong';
+    if (rssi >= -67) return 'Good';
+    if (rssi >= -75) return 'Fair';
+    return 'Weak';
+}
+
+function execFileText(file, args, options = {}) {
+    return new Promise((resolve) => {
+        execFile(file, args, options, (error, stdout) => {
+            if (error) {
+                resolve('');
+                return;
+            }
+            resolve(stdout || '');
+        });
+    });
+}
+
+function parseAirportWifiStatus(output) {
+    if (!output) return null;
+    const stateMatch = output.match(/^\s*state:\s*(.+)$/m);
+    const rssiMatch = output.match(/^\s*agrCtlRSSI:\s*(-?\d+)\s*$/m);
+    const state = stateMatch ? stateMatch[1].trim().toLowerCase() : '';
+    if (state === 'running' && rssiMatch) {
+        const rssi = Number(rssiMatch[1]);
+        return { state: 'connected', percent: parseWifiPercent(rssi), quality: getWifiQualityLabel(rssi) };
+    }
+    return null;
+}
+
+function parseSystemProfilerWifiStatus(output) {
+    if (!output) return null;
+    const connected = /Status:\s*Connected/i.test(output);
+    const signalMatch = output.match(/Signal \/ Noise:\s*(-?\d+)\s*dBm/i);
+    if (connected && signalMatch) {
+        const rssi = Number(signalMatch[1]);
+        return { state: 'connected', percent: parseWifiPercent(rssi), quality: getWifiQualityLabel(rssi) };
+    }
+    if (/Status:\s*Off/i.test(output)) {
+        return { state: 'off', percent: null, quality: null };
+    }
+    return null;
+}
+
+async function getWifiStatus() {
+    const airportPath = '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport';
+    const airportOutput = await execFileText(airportPath, ['-I'], { timeout: 2_000 });
+    const airportStatus = parseAirportWifiStatus(airportOutput);
+    if (airportStatus) return airportStatus;
+
+    const profilerOutput = await execFileText('system_profiler', ['SPAirPortDataType'], { timeout: 5_000, maxBuffer: 1024 * 1024 });
+    const profilerStatus = parseSystemProfilerWifiStatus(profilerOutput);
+    if (profilerStatus) return profilerStatus;
+
+    return { state: 'off', percent: null, quality: null };
+}
+
+function formatUptime(seconds) {
+    if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return null;
+    const totalMinutes = Math.floor(seconds / 60);
+    const days = Math.floor(totalMinutes / (60 * 24));
+    const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+    const minutes = totalMinutes % 60;
+    if (days > 0) return `Up ${days}d ${hours}h`;
+    if (hours > 0) return `Up ${hours}h ${minutes}m`;
+    return `Up ${minutes}m`;
+}
+
+function formatMachineStatusLine(snapshot) {
+    const parts = [];
+    const batteryLabel = formatBatteryStatus(snapshot);
+    if (batteryLabel !== 'BAT -') parts.push(batteryLabel);
+    const uptimeLabel = formatUptime(snapshot.uptimeSeconds);
+    if (uptimeLabel) parts.push(uptimeLabel);
+    if (snapshot.wifiState === 'connected' && snapshot.wifiQuality) {
+        parts.push(`Wi-Fi ${snapshot.wifiQuality}`);
+    } else {
+        parts.push('Wi-Fi off');
+    }
+    return `│ ${parts.join('   ')}`;
 }
 
 function formatConsoleHeartbeat(snapshot, previousSnapshot) {
@@ -193,11 +278,17 @@ function formatConsoleHeartbeat(snapshot, previousSnapshot) {
     const freeTrend = trendArrow(snapshot.freeGb, previousSnapshot?.freeGb, 0.03);
     const swapTrend = trendArrow(snapshot.swapGb, previousSnapshot?.swapGb, 0.03);
     const reasonTag = snapshot.level === 'ok' ? '' : compactReasonTag(snapshot.reasons);
-    const reasonPart = reasonTag ? ` | Reason ${reasonTag}` : '';
-    const causePart = snapshot.level === 'ok' ? '' : ` | Cause ${snapshot.interpretation.cause}`;
-    const batteryPart = ` | ${formatBatteryStatus(snapshot)}`;
-    const tempPart = formatTemperatureStatus(snapshot);
-    return `[${new Date(snapshot.timestamp).toLocaleString()}] ${pulse} | Level ${snapshot.level.toUpperCase()} | Score ${snapshot.slowScore} | CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend} | Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend} | Disk ${snapshot.diskPercent.toFixed(0)}% | Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend} | Swap ${snapshot.swapGb.toFixed(2)}GB ${swapTrend} | Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend}${batteryPart}${tempPart} | Hogs ${snapshot.topApps}${reasonPart}${causePart}`;
+    const timestamp = new Date(snapshot.timestamp).toLocaleTimeString();
+    const datestamp = new Date(snapshot.timestamp).toLocaleDateString();
+    const header = `┌ ${pulse} ${snapshot.level.toUpperCase()}  Score ${snapshot.slowScore}  @${timestamp} ${datestamp}`;
+    const loadLine = `│ CPU ${snapshot.cpuPercent.toFixed(0)}% ${cpuTrend}   Pressure ${snapshot.pressurePercent.toFixed(0)}% ${pressureTrend}   Disk ${snapshot.diskPercent.toFixed(0)}%`;
+    const resourceLine = `│ Free ${snapshot.freeGb.toFixed(2)}GB ${freeTrend}   Swap ${snapshot.swapGb.toFixed(2)}GB ${swapTrend}   Lag ${snapshot.lagMs.toFixed(0)}ms ${lagTrend}`;
+    const envLine = formatMachineStatusLine(snapshot);
+    const contextParts = [`Hogs ${snapshot.topApps}`];
+    if (reasonTag) contextParts.push(`Reason ${reasonTag}`);
+    if (snapshot.level !== 'ok') contextParts.push(snapshot.interpretation.cause);
+    const hogsLine = `└ ${contextParts.join('   |   ')}`;
+    return [header, loadLine, resourceLine, envLine, hogsLine, '┆'].join('\n');
 }
 
 function buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
@@ -288,13 +379,14 @@ async function logSystemHealth() {
     if (isRunning) return;
     isRunning = true;
     try {
-        const [mem, procs, load, disks, battery, cpuTemp] = await Promise.all([
+        const [mem, procs, load, disks, battery, cpuTemp, wifiStatus] = await Promise.all([
             safeGet('mem', () => si.mem(), { available: 0, swapused: 0, active: 0, total: 1 }),
             safeGet('processes', () => si.processes(), { list: [] }),
             safeGet('cpu', () => si.currentLoad(), { currentLoad: 0 }),
             safeGet('disk', () => si.fsSize(), []),
             safeGet('battery', () => si.battery(), { hasbattery: false, percent: null, ischarging: false, acconnected: false }),
-            safeGet('cpuTemperature', () => si.cpuTemperature(), { main: null, max: null })
+            safeGet('cpuTemperature', () => si.cpuTemperature(), { main: null, max: null }),
+            safeGet('wifi', () => getWifiStatus(), { state: 'off', percent: null, quality: null })
         ]);
         const timestamp = new Date().toLocaleString();
 
@@ -324,6 +416,10 @@ async function logSystemHealth() {
             batteryPercent: typeof battery.percent === 'number' ? Number(battery.percent.toFixed(0)) : null,
             batteryCharging: Boolean(battery.ischarging || battery.acconnected),
             cpuTempC: typeof cpuTemp.main === 'number' ? Number(cpuTemp.main.toFixed(1)) : null,
+            uptimeSeconds: os.uptime(),
+            wifiState: wifiStatus.state,
+            wifiPercent: typeof wifiStatus.percent === 'number' ? wifiStatus.percent : null,
+            wifiQuality: wifiStatus.quality || null,
             slowScore,
             level,
             topApps,
@@ -346,7 +442,7 @@ async function logSystemHealth() {
 
         await rotateLogIfNeeded(timestamp);
         await fsp.appendFile(config.logPath, logMessage);
-        console.log(consoleMessage);
+        console.log(`${consoleMessage}\n`);
 
         slowStreak = level === 'ok' ? 0 : slowStreak + 1;
         criticalStreak = level === 'critical' ? criticalStreak + 1 : 0;
