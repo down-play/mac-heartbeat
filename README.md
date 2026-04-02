@@ -116,13 +116,19 @@ It is based on a weighted mix of:
 
 The current weighting is:
 
-- CPU: 30%
-- Memory pressure: 28%
-- Swap: 22%
-- Disk: 10%
-- Lag: 10%
+- CPU: 20%
+- Memory pressure: 42%
+- Swap: 18%
+- Disk: 5%
+- Lag: 15%
 
 Each metric is compared against a threshold in `heartbeat.js`, then combined into one score.
+
+On macOS, the `Pressure` value now comes from the native `memory_pressure -Q` tool, which tracks system-wide free-memory pressure more closely than simple RAM occupancy. If that command is unavailable, the app falls back to the older `used vs available RAM` estimate.
+
+The score now also leans harder on memory pressure and less on background metrics like disk fullness, so a higher-capacity Mac should look meaningfully healthier under the same light workload. Swap thresholding scales with installed RAM, capped at `12 GB`, so bigger-memory machines do not get over-penalized for small amounts of swap.
+
+To avoid false positives, very low-level background activity is treated as noise before it starts contributing to the score.
 
 Current thresholds:
 
@@ -164,7 +170,25 @@ Most people will only need these local overrides:
 
 Additional optional overrides are also supported for advanced tuning, including interval, log size, alert cooldown, dashboard port, history limits, and sustain-cycle settings.
 
-If you want to change how much each metric affects the score, edit the weights inside `computeSlowScore()`.
+If you want to change how much each metric affects the score, edit the `weights` block near the top of `heartbeat.js`, or override them locally with:
+
+```env
+HEARTBEAT_WEIGHT_PRESSURE=0.42
+HEARTBEAT_WEIGHT_SWAP=0.18
+HEARTBEAT_WEIGHT_CPU=0.20
+HEARTBEAT_WEIGHT_DISK=0.05
+HEARTBEAT_WEIGHT_LAG=0.15
+```
+
+Advanced users can also adjust the low-end noise floors:
+
+```env
+HEARTBEAT_FLOOR_PRESSURE=0.25
+HEARTBEAT_FLOOR_SWAP=0.10
+HEARTBEAT_FLOOR_CPU=0.20
+HEARTBEAT_FLOOR_DISK=0.50
+HEARTBEAT_FLOOR_LAG=0.25
+```
 
 ## Alerts
 

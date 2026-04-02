@@ -42,6 +42,20 @@ const baseConfig = {
         cpuPercent: 85,
         diskPercent: 90,
         lagMs: 120
+    },
+    weights: {
+        pressure: 0.42,
+        swap: 0.18,
+        cpu: 0.20,
+        disk: 0.05,
+        lag: 0.15
+    },
+    floors: {
+        pressure: 0.25,
+        swap: 0.10,
+        cpu: 0.20,
+        disk: 0.50,
+        lag: 0.25
     }
 };
 
@@ -69,6 +83,20 @@ const config = {
         cpuPercent: getEnvNumber('HEARTBEAT_CPU_PERCENT', baseConfig.thresholds.cpuPercent),
         diskPercent: getEnvNumber('HEARTBEAT_DISK_PERCENT', baseConfig.thresholds.diskPercent),
         lagMs: getEnvNumber('HEARTBEAT_LAG_MS', baseConfig.thresholds.lagMs)
+    },
+    weights: {
+        pressure: getEnvNumber('HEARTBEAT_WEIGHT_PRESSURE', baseConfig.weights.pressure),
+        swap: getEnvNumber('HEARTBEAT_WEIGHT_SWAP', baseConfig.weights.swap),
+        cpu: getEnvNumber('HEARTBEAT_WEIGHT_CPU', baseConfig.weights.cpu),
+        disk: getEnvNumber('HEARTBEAT_WEIGHT_DISK', baseConfig.weights.disk),
+        lag: getEnvNumber('HEARTBEAT_WEIGHT_LAG', baseConfig.weights.lag)
+    },
+    floors: {
+        pressure: getEnvNumber('HEARTBEAT_FLOOR_PRESSURE', baseConfig.floors.pressure),
+        swap: getEnvNumber('HEARTBEAT_FLOOR_SWAP', baseConfig.floors.swap),
+        cpu: getEnvNumber('HEARTBEAT_FLOOR_CPU', baseConfig.floors.cpu),
+        disk: getEnvNumber('HEARTBEAT_FLOOR_DISK', baseConfig.floors.disk),
+        lag: getEnvNumber('HEARTBEAT_FLOOR_LAG', baseConfig.floors.lag)
     }
 };
 
@@ -118,6 +146,15 @@ function percentOfThreshold(value, threshold) {
     return Math.min(100, (value / threshold) * 100);
 }
 
+function percentOfThresholdWithFloor(value, threshold, floorRatio = 0) {
+    if (!threshold) return 0;
+    const floorValue = Math.max(0, threshold * floorRatio);
+    if (value <= floorValue) return 0;
+    const adjustedThreshold = threshold - floorValue;
+    if (adjustedThreshold <= 0) return 100;
+    return Math.min(100, ((value - floorValue) / adjustedThreshold) * 100);
+}
+
 function getLagMetrics() {
     const meanMs = Number(loopDelay.mean) / 1e6;
     const maxMs = Number(loopDelay.max) / 1e6;
@@ -128,19 +165,28 @@ function getLagMetrics() {
     };
 }
 
-function computeSlowScore({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
-    const pressureScore = percentOfThreshold(pressurePercent, config.thresholds.pressurePercent);
-    const swapScore = percentOfThreshold(swapGb, config.thresholds.swapGb);
-    const cpuScore = percentOfThreshold(cpuPercent, config.thresholds.cpuPercent);
-    const diskScore = percentOfThreshold(diskPercent, config.thresholds.diskPercent);
-    const lagScore = percentOfThreshold(lagMs, config.thresholds.lagMs);
+function getEffectiveThresholds(totalMemoryBytes) {
+    const totalMemoryGb = toGB(totalMemoryBytes);
+    const scaledSwapGb = Math.min(12, Math.max(config.thresholds.swapGb, totalMemoryGb * 0.15));
+    return {
+        ...config.thresholds,
+        swapGb: scaledSwapGb
+    };
+}
+
+function computeSlowScore({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, thresholds) {
+    const pressureScore = percentOfThresholdWithFloor(pressurePercent, thresholds.pressurePercent, config.floors.pressure);
+    const swapScore = percentOfThresholdWithFloor(swapGb, thresholds.swapGb, config.floors.swap);
+    const cpuScore = percentOfThresholdWithFloor(cpuPercent, thresholds.cpuPercent, config.floors.cpu);
+    const diskScore = percentOfThresholdWithFloor(diskPercent, thresholds.diskPercent, config.floors.disk);
+    const lagScore = percentOfThresholdWithFloor(lagMs, thresholds.lagMs, config.floors.lag);
 
     const weighted =
-        pressureScore * 0.28 +
-        swapScore * 0.17 +
-        cpuScore * 0.30 +
-        diskScore * 0.10 +
-        lagScore * 0.15;
+        pressureScore * config.weights.pressure +
+        swapScore * config.weights.swap +
+        cpuScore * config.weights.cpu +
+        diskScore * config.weights.disk +
+        lagScore * config.weights.lag;
     return Math.round(weighted);
 }
 
@@ -206,6 +252,25 @@ function execFileText(file, args, options = {}) {
     });
 }
 
+function getFallbackPressurePercent(mem) {
+    return ((mem.total - mem.available) / Math.max(mem.total, 1)) * 100;
+}
+
+function parseMemoryPressurePercent(output) {
+    if (!output) return null;
+    const freeMatch = output.match(/System-wide memory free percentage:\s*(\d+)%/i);
+    if (!freeMatch) return null;
+    const freePercent = Number(freeMatch[1]);
+    if (!Number.isFinite(freePercent)) return null;
+    return Math.max(0, Math.min(100, 100 - freePercent));
+}
+
+async function getMacMemoryPressurePercent() {
+    if (os.platform() !== 'darwin') return null;
+    const output = await execFileText('memory_pressure', ['-Q'], { timeout: 2_000 });
+    return parseMemoryPressurePercent(output);
+}
+
 function parseAirportWifiStatus(output) {
     if (!output) return null;
     const stateMatch = output.match(/^\s*state:\s*(.+)$/m);
@@ -216,6 +281,38 @@ function parseAirportWifiStatus(output) {
         return { state: 'connected', percent: parseWifiPercent(rssi), quality: getWifiQualityLabel(rssi) };
     }
     return null;
+}
+
+function parseSystemProfilerWifiStatusJson(output) {
+    if (!output) return { interfaceNames: [] };
+    try {
+        const parsed = JSON.parse(output);
+        const entries = Array.isArray(parsed.SPAirPortDataType) ? parsed.SPAirPortDataType : [];
+        const interfaces = entries.flatMap((entry) => Array.isArray(entry.spairport_airport_interfaces) ? entry.spairport_airport_interfaces : []);
+        const interfaceNames = interfaces
+            .map((item) => typeof item._name === 'string' ? item._name.trim() : '')
+            .filter(Boolean);
+
+        for (const item of interfaces) {
+            const status = String(item.spairport_status_information || '').toLowerCase();
+            const rssi = Number(item.spairport_signal_noise || item.spairport_rssi);
+            if (status.includes('connected') || status.includes('running') || status.includes('associated')) {
+                return {
+                    state: 'connected',
+                    percent: Number.isFinite(rssi) ? parseWifiPercent(rssi) : null,
+                    quality: Number.isFinite(rssi) ? getWifiQualityLabel(rssi) : null,
+                    interfaceNames
+                };
+            }
+            if (status.includes('off')) {
+                return { state: 'off', percent: null, quality: null, interfaceNames };
+            }
+        }
+
+        return { interfaceNames };
+    } catch {
+        return { interfaceNames: [] };
+    }
 }
 
 function parseSystemProfilerWifiStatus(output) {
@@ -232,15 +329,45 @@ function parseSystemProfilerWifiStatus(output) {
     return null;
 }
 
+function parseIfconfigWifiStatus(output) {
+    if (!output) return null;
+    const isActive = /status:\s*active/i.test(output);
+    const hasIpv4 = /^\s*inet\s+\d+\.\d+\.\d+\.\d+/m.test(output);
+    if (isActive || hasIpv4) {
+        return { state: 'connected', percent: null, quality: null };
+    }
+    return null;
+}
+
 async function getWifiStatus() {
-    const airportPath = '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport';
-    const airportOutput = await execFileText(airportPath, ['-I'], { timeout: 2_000 });
-    const airportStatus = parseAirportWifiStatus(airportOutput);
-    if (airportStatus) return airportStatus;
+    const airportPaths = [
+        '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport',
+        '/usr/local/bin/airport'
+    ];
+    for (const airportPath of airportPaths) {
+        const airportOutput = await execFileText(airportPath, ['-I'], { timeout: 2_000 });
+        const airportStatus = parseAirportWifiStatus(airportOutput);
+        if (airportStatus) return airportStatus;
+    }
+
+    const profilerJsonOutput = await execFileText('system_profiler', ['SPAirPortDataType', '-json'], { timeout: 5_000, maxBuffer: 1024 * 1024 });
+    const profilerJsonStatus = parseSystemProfilerWifiStatusJson(profilerJsonOutput);
+    if (profilerJsonStatus?.state) {
+        return profilerJsonStatus;
+    }
 
     const profilerOutput = await execFileText('system_profiler', ['SPAirPortDataType'], { timeout: 5_000, maxBuffer: 1024 * 1024 });
     const profilerStatus = parseSystemProfilerWifiStatus(profilerOutput);
     if (profilerStatus) return profilerStatus;
+
+    const candidateInterfaces = profilerJsonStatus.interfaceNames?.length
+        ? profilerJsonStatus.interfaceNames
+        : ['en0', 'en1'];
+    for (const name of candidateInterfaces) {
+        const ifconfigOutput = await execFileText('ifconfig', [name], { timeout: 2_000 });
+        const ifconfigStatus = parseIfconfigWifiStatus(ifconfigOutput);
+        if (ifconfigStatus) return ifconfigStatus;
+    }
 
     return { state: 'off', percent: null, quality: null };
 }
@@ -256,17 +383,19 @@ function formatUptime(seconds) {
     return `Up ${minutes}m`;
 }
 
+function formatWifiStatus(snapshot) {
+    if (snapshot.wifiState !== 'connected') return 'Wi-Fi off';
+    if (snapshot.wifiQuality) return `Wi-Fi ${snapshot.wifiQuality}`;
+    return 'Wi-Fi ?';
+}
+
 function formatMachineStatusLine(snapshot) {
     const parts = [];
     const batteryLabel = formatBatteryStatus(snapshot);
     if (batteryLabel !== 'BAT -') parts.push(batteryLabel);
     const uptimeLabel = formatUptime(snapshot.uptimeSeconds);
     if (uptimeLabel) parts.push(uptimeLabel);
-    if (snapshot.wifiState === 'connected' && snapshot.wifiQuality) {
-        parts.push(`Wi-Fi ${snapshot.wifiQuality}`);
-    } else {
-        parts.push('Wi-Fi off');
-    }
+    parts.push(formatWifiStatus(snapshot));
     return `│ ${parts.join('   ')}`;
 }
 
@@ -291,36 +420,36 @@ function formatConsoleHeartbeat(snapshot, previousSnapshot) {
     return [header, loadLine, resourceLine, envLine, hogsLine, '┆'].join('\n');
 }
 
-function buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
+function buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, thresholds) {
     const reasons = [];
-    if (pressurePercent >= config.thresholds.pressurePercent) reasons.push(`pressure ${pressurePercent}%`);
-    if (swapGb >= config.thresholds.swapGb) reasons.push(`swap ${swapGb.toFixed(2)}GB`);
-    if (cpuPercent >= config.thresholds.cpuPercent) reasons.push(`cpu ${cpuPercent.toFixed(0)}%`);
-    if (diskPercent >= config.thresholds.diskPercent) reasons.push(`disk ${diskPercent.toFixed(0)}%`);
-    if (lagMs >= config.thresholds.lagMs) reasons.push(`event-loop lag ${lagMs.toFixed(0)}ms`);
+    if (pressurePercent >= thresholds.pressurePercent) reasons.push(`pressure ${pressurePercent}%`);
+    if (swapGb >= thresholds.swapGb) reasons.push(`swap ${swapGb.toFixed(2)}GB`);
+    if (cpuPercent >= thresholds.cpuPercent) reasons.push(`cpu ${cpuPercent.toFixed(0)}%`);
+    if (diskPercent >= thresholds.diskPercent) reasons.push(`disk ${diskPercent.toFixed(0)}%`);
+    if (lagMs >= thresholds.lagMs) reasons.push(`event-loop lag ${lagMs.toFixed(0)}ms`);
     return reasons;
 }
 
-function interpretSituation({ level, pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }) {
+function interpretSituation({ level, pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, thresholds) {
     if (level === 'ok') {
         return {
             cause: 'System operating normally',
             action: 'No action needed.'
         };
     }
-    if (swapGb >= config.thresholds.swapGb && pressurePercent >= config.thresholds.pressurePercent) {
+    if (swapGb >= thresholds.swapGb && pressurePercent >= thresholds.pressurePercent) {
         return {
             cause: 'Memory bottleneck likely',
             action: 'Close high-memory apps and reduce parallel tabs/processes.'
         };
     }
-    if (cpuPercent >= config.thresholds.cpuPercent && pressurePercent < config.thresholds.pressurePercent) {
+    if (cpuPercent >= thresholds.cpuPercent && pressurePercent < thresholds.pressurePercent) {
         return {
             cause: 'CPU-bound workload likely',
             action: 'Check top CPU processes and stop/defer heavy tasks.'
         };
     }
-    if (diskPercent >= config.thresholds.diskPercent || lagMs >= config.thresholds.lagMs) {
+    if (diskPercent >= thresholds.diskPercent || lagMs >= thresholds.lagMs) {
         return {
             cause: 'I/O or responsiveness bottleneck likely',
             action: 'Free disk space and reduce concurrent disk-heavy activity.'
@@ -379,32 +508,36 @@ async function logSystemHealth() {
     if (isRunning) return;
     isRunning = true;
     try {
-        const [mem, procs, load, disks, battery, cpuTemp, wifiStatus] = await Promise.all([
+        const [mem, procs, load, disks, battery, cpuTemp, wifiStatus, macPressurePercent] = await Promise.all([
             safeGet('mem', () => si.mem(), { available: 0, swapused: 0, active: 0, total: 1 }),
             safeGet('processes', () => si.processes(), { list: [] }),
             safeGet('cpu', () => si.currentLoad(), { currentLoad: 0 }),
             safeGet('disk', () => si.fsSize(), []),
             safeGet('battery', () => si.battery(), { hasbattery: false, percent: null, ischarging: false, acconnected: false }),
             safeGet('cpuTemperature', () => si.cpuTemperature(), { main: null, max: null }),
-            safeGet('wifi', () => getWifiStatus(), { state: 'off', percent: null, quality: null })
+            safeGet('wifi', () => getWifiStatus(), { state: 'off', percent: null, quality: null }),
+            safeGet('memoryPressure', () => getMacMemoryPressurePercent(), null)
         ]);
         const timestamp = new Date().toLocaleString();
 
         const freeGb = toGB(mem.available);
         const swapGb = toGB(mem.swapused);
-        const pressurePercent = ((mem.total - mem.available) / Math.max(mem.total, 1)) * 100;
+        const pressurePercent = typeof macPressurePercent === 'number'
+            ? macPressurePercent
+            : getFallbackPressurePercent(mem);
+        const effectiveThresholds = getEffectiveThresholds(mem.total);
         const cpuPercent = load.currentLoad;
         const rootDisk = disks.find((d) => d.mount === '/') || disks[0];
         const diskPercent = rootDisk ? rootDisk.use : 0;
         const lag = getLagMetrics();
         const lagMs = Math.max(lag.meanMs, lag.maxMs);
-        const slowScore = computeSlowScore({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs });
+        const slowScore = computeSlowScore({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, effectiveThresholds);
         const level = getLevel(slowScore);
         const previousSnapshot = latestSnapshot;
 
         const topApps = formatTopApps(procs.list, config.topAppsCount);
-        const reasons = buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs });
-        const interpretation = interpretSituation({ level, pressurePercent, swapGb, cpuPercent, diskPercent, lagMs });
+        const reasons = buildAlertReasons({ pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, effectiveThresholds);
+        const interpretation = interpretSituation({ level, pressurePercent, swapGb, cpuPercent, diskPercent, lagMs }, effectiveThresholds);
         const snapshot = {
             timestamp: new Date().toISOString(),
             pressurePercent: Number(pressurePercent.toFixed(1)),
